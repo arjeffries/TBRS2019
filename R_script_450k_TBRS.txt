@@ -1,0 +1,405 @@
+#R script used for analysis in "Growth disrupting mutations in epigenetic regulatory molecules are associated with abnormalities of epigenetic aging"
+#https://github.com/arjeffries/TBRS2019
+
+library(limma)
+library(minfi)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylation450kmanifest)
+library(RColorBrewer)
+library(missMethyl)
+library(matrixStats)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+library(GenomicRanges)
+library(reshape2)
+library(wateRmelon)
+
+setwd("/mnt/data1/DNMT3A")
+cross <- read.csv('CrossHybridisingProbesPriceORWeksberg.csv')
+annot <- read.csv("AdditionalAnnotation450K_Price_Great_SNPsinProbeSequence.csv", stringsAsFactors = F)
+pheno<-read.csv("SampleSheet.csv", stringsAsFactors = FALSE)
+
+#readin files
+path <- "/mnt/data1/DNMT3A/idat"
+m <- readEPIC(path, n=T, oob=T)
+
+#normalize
+meth.pf <- pfilter(m)
+meth.pf.dasen <- dasen(meth.pf)
+beta <- betas(meth.pf.dasen)
+rawbeta <- betas(m)
+
+#remove crosshyb probes
+y <- rownames(beta)
+x <- y %in% cross$x
+beta <- beta[!x,]
+
+#remove crosshyb probes
+y <- rownames(rawbeta)
+x <- y %in% cross$x
+rawbeta <- rawbeta[!x,]
+
+#remove common SNPs from Weksburg list
+y <- rownames(beta)
+x <- y %in% annot$TargetID[annot$Weksburg_CommonSNP_Af_within10bpSBE != ""]
+beta <- beta[!x,]
+
+#remove common SNPs from Illumina list
+y <- rownames(beta)
+x <- y %in% annot$TargetID[annot$Illumina_CommonSNP_Af_within10bpSBE != ""]
+beta <- beta[!x,]
+
+#remove common SNPs from Weksburg list
+y <- rownames(rawbeta)
+x <- y %in% annot$TargetID[annot$Weksburg_CommonSNP_Af_within10bpSBE != ""]
+rawbeta <- rawbeta[!x,]
+
+#remove common SNPs from Illumina list
+y <- rownames(rawbeta)
+x <- y %in% annot$TargetID[annot$Illumina_CommonSNP_Af_within10bpSBE != ""]
+rawbeta <- rawbeta[!x,]
+
+#remove rs SNPs
+beta <- beta[!grepl("rs", rownames(beta)),]
+
+#Lookup in annotation
+cg <- rownames(beta)
+y <- match(cg,annot$TargetID)
+annot <- annot[y,]  #retrieve annot in correct order and trim out unused probes
+
+#add more friendly names to the columns
+x <- colnames(beta)
+x <- gsub("outlier/","",x) #added as outlier string added by watermelon in new version ?
+idatID <- paste(pheno$Sentrix_ID,"_",pheno$Sentrix_Position, sep="")
+y <- match(x,idatID)
+y <- pheno[y,3]  #substitue in real names
+colnames(beta) <- y
+
+#add more friendly names to the columns
+x <- colnames(rawbeta)
+idatID <- paste(pheno$Sentrix_ID,"_",pheno$Sentrix_Position, sep="")
+y <- match(x,idatID)
+y <- pheno[y,3]  #substitue in real names
+colnames(rawbeta) <- y
+
+#reshuffle the pheno file so that in the same order
+x <- colnames(beta)
+y <- match(x,pheno$Sample_ID)
+pheno <- pheno[y,]  #retrieve annot in correct order
+pheno$Genotype <- as.factor(pheno$Genotype)
+
+#Make a beta matrix and annotation matrix with no X or Y Chromosome data
+beta_noxy <- beta[annot$CHR_37 !="X" & annot$CHR_37 !="Y" & annot$CHR_37 != "XY",]
+annot_noxy <- annot[annot$CHR_37 !="X" & annot$CHR_37 !="Y" & annot$CHR_37 != "XY",]
+
+
+#Check bisulfite conversion rates
+greenChannel<-intensitiesByChannel(QCdata(m))$Cy3 
+redChannel<-intensitiesByChannel(QCdata(m))$Cy5 
+
+### these are fully methylated controls so closer to 1/100% the better the BS conversion. 
+### NOTE due to different chemistries type I conversion controls and type II conversion controls need to be handled differently. 
+greenChannel<-greenChannel[grep("BS.Conversion", rownames(greenChannel)),] 
+redChannel<-redChannel[grep("BS.Conversion", rownames(redChannel)),] 
+BScon1<-rbind(greenChannel[c("BS.Conversion.I.C1", "BS.Conversion.I.C2", "BS.Conversion.I.C3"),], 
+redChannel[c("BS.Conversion.I.C4", "BS.Conversion.I.C5", "BS.Conversion.I.C6"),]) ## this is method 1 
+BScon2<-redChannel[c("BS.Conversion.II.1", "BS.Conversion.II.2", "BS.Conversion.II.3", "BS.Conversion.II.4"),] 
+## this is method 1 
+### for type II probes red channel is M and green channel is U so easy conversion into beta values 
+BScon2.betas<-redChannel[c("BS.Conversion.II.1", "BS.Conversion.II.2", "BS.Conversion.II.3", 
+"BS.Conversion.II.4"),]/(redChannel[c("BS.Conversion.II.1", "BS.Conversion.II.2", "BS.Conversion.II.3","BS.Conversion.II.4"),]+greenChannel[c("BS.Conversion.II.1","BS.Conversion.II.2","BS.Conversion.II.3","BS.Conversion.II.4"),]) 
+### for type I both methylated and unmethylated in the same channel 
+BScon1.betas<-rbind(greenChannel[c("BS.Conversion.I.C1", "BS.Conversion.I.C2","BS.Conversion.I.C3"),], redChannel[c("BS.Conversion.I.C4", "BS.Conversion.I.C5", "BS.Conversion.I.C6"),])/(rbind(greenChannel[c("BS.Conversion.I.C1","BS.Conversion.I.C2","BS.Conversion.I.C3"),], redChannel[c("BS.Conversion.I.C4", "BS.Conversion.I.C5","BS.Conversion.I.C6"),]) + rbind(greenChannel[c("BS.Conversion.I.U1", "BS.Conversion.I.U2","BS.Conversion.I.U3"),], redChannel[c("BS.Conversion.I.U4", "BS.Conversion.I.U5","BS.Conversion.I.U6"),])) 
+BScon.betas<-rbind(BScon1.betas, BScon2.betas) 
+BScon.beta.median<-apply(BScon.betas, 2, median)*100
+boxplot(BScon.betas, las=2)
+
+
+# visualise what the data looks like before and after normalisation
+par(mfrow=c(1,2))
+densityPlot(rawbeta, sampGroups=pheno$Genotype,main="Raw", legend=FALSE)
+legend("top", legend = levels(factor(pheno$Genotype)), text.col=brewer.pal(8,"Dark2"))
+densityPlot(beta, sampGroups=pheno$Genotype,main="Normalized", legend=FALSE)
+legend("top", legend = levels(factor(pheno$Genotype)),text.col=brewer.pal(8,"Dark2"))
+
+# Visualise with autosomes only
+densityPlot(beta_noxy, sampGroups=pheno$Genotype,main="Normalized", legend=FALSE)
+legend("top", legend = levels(factor(pheno$Genotype)),text.col=brewer.pal(8,"Dark2"))
+
+
+# Visualise methylation density of autosome only data in specific samples for supplementary figure creation
+par(mfrow=c(2,1))
+samples <- c("4169","4170")  # 19 and 20y
+densityPlot(beta_noxy[,(colnames(beta_noxy) %in% samples)], sampGroups=pheno$Genotype[pheno$Sample_ID %in% samples],main="Age/sex matched Amish DNMT3A variant carrier (CT) vs unaffected sib (CC) - pair 1", legend=TRUE)
+samples <- c("4161","4167") # 24 and 25 year old
+densityPlot(beta_noxy[,(colnames(beta_noxy) %in% samples)], sampGroups=pheno$Genotype[pheno$Sample_ID %in% samples],main="Age/sex matched Amish DNMT3A variant carrier (CT) vs unaffected sib (CC) - pair 2", legend=TRUE)
+
+#Perform statistical comparison (Wilcoxon Rank Sum test)
+samples <- c("4170","4169")  # 19 and 20y
+x <- beta_noxy[,(colnames(beta_noxy) %in% samples[1])]
+y <- beta_noxy[,(colnames(beta_noxy) %in% samples[2])]
+wilcox.test(x,y)
+summary(x) # CC
+summary(y) # CT
+
+samples <- c("4167","4161") # 24 and 25 year old
+x <- beta_noxy[,(colnames(beta_noxy) %in% samples[1])]
+y <- beta_noxy[,(colnames(beta_noxy) %in% samples[2])]
+wilcox.test(x,y)
+summary(x) # CC
+summary(y) # CT
+
+
+##Perform LIMMA on autosomes (no sex chromosomes) to determine DMPs
+phenotempf <- pheno$Sex == "F" #make a 'F' score to match 'M' score
+design <- model.matrix(~ 0+factor(pheno$Genotype)+factor(pheno$Sex)+factor(phenotempf))
+colnames(design) <- c("CC", "CT", "M", "F")
+contrast.matrix <- makeContrasts(CT-CC, levels=design) #make a contrast to limit comparison to genotype but correct for Sex
+fit <- lmFit(beta_noxy, design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+DMPs <- toptable(fit2, number=nrow(fit2)) # full list
+sig <- subset(DMPs, DMPs$adj.P.Val < 0.05) # significant DMPs
+
+
+
+#Make a Volcano plot
+pdf("volcano_fig1.pdf")
+CTmean <- apply(beta_noxy[,pheno$Genotype=="CT"],1,mean)
+CCmean <- apply(beta_noxy[,pheno$Genotype=="CC"],1,mean)
+deltabeta <- CTmean - CCmean
+plot(DMPs$logFC,-log10(DMPs$P.Value), pch=20, ylab=expression("-log"[10]*"(p-values)"), xlab=expression("log"[2]*"(fold change)"), cex.lab=1.5, cex.axis=1.3)
+points(DMPs$logFC[DMPs$adj.P.Val < 0.05],-log10(DMPs$P.Value[DMPs$adj.P.Val < 0.05]), pch=20, col="red")
+dev.off()
+
+
+
+##Rearrange DMPs variable to order for flattening (below) which will allow probe to feature assessment
+y <- match(row.names(beta_noxy),row.names(DMPs))
+DMPs_noxy <- DMPs[y,]  #retrieve annot in correct order and remove any not there
+CTmean <- apply(beta_noxy[,pheno$Genotype=="CT"],1,mean)
+CCmean <- apply(beta_noxy[,pheno$Genotype=="CC"],1,mean)
+deltabeta <- CTmean - CCmean
+
+for(i in 1:nrow(annot_noxy)){
+if (annot_noxy$UCSC_RefGene_Group[i] == "") { annot_noxy$UCSC_RefGene_Group[i] <- "intergenic" 
+annot_noxy$UCSC_RefGene_Name[i] <- paste("intergenic",i,sep="") }}
+
+
+
+#flatten out the descriptors for methylation	
+	genestore <- ""
+	refseqstore <- ""
+	datastore <- NA
+	cpgstore <- ""
+	x <- data.frame()
+	xindex <- 1
+	for(i in 1:nrow(annot_noxy)){
+		gene <- unlist(strsplit(as.character(annot_noxy$UCSC_RefGene_Name)[i], ";"))
+		if(length(gene) > 0) {
+		refseq <- unlist(strsplit(as.character(annot_noxy$UCSC_RefGene_Group)[i], ";"))
+#		if (length(refseq)==0) { refseq <- "intergenic" }
+		cpg <- unlist(strsplit(as.character(annot_noxy$Relation_to_UCSC_CpG_Island)[i], ";"))
+		for(gi in 1:length(gene)) {
+			genestore[xindex] <- gene[gi]
+			refseqstore[xindex] <- refseq[gi]
+			cpgstore[xindex] <- cpg[gi]
+			datastore[xindex] <- i
+			xindex <- xindex + 1
+	}}}
+flatgene <- data.frame(annot_noxy$TargetID[datastore], genestore,refseqstore,cpgstore,beta_noxy[datastore,], CCmean[datastore], CTmean[datastore], deltabeta[datastore], DMPs_noxy$adj.P.Val[datastore])	
+x <- colnames(flatgene)
+x[1] <- "TargetID"
+colnames(flatgene) <- x   #rename columns
+
+flatcpg <- flatgene[!duplicated(flatgene[c("TargetID","cpgstore")]),]	
+flatgene <- flatgene[!duplicated(flatgene[c("TargetID", "refseqstore")]),]	
+
+bkcountsgene <- summary(flatgene$refseqstore)
+bkcountscpg <- summary(flatcpg$cpgstore)
+countsgene <- summary(flatgene$refseqstore[flatgene$DMPs_noxy.adj.P.Val.datastore. < 0.05])
+countscpg <- summary(flatcpg$cpgstore[flatcpg$DMPs_noxy.adj.P.Val.datastore. < 0.05])
+bkcountsgene
+countsgene
+bkcountscpg
+countscpg
+
+
+## Perform DMR analysis using DMRcate
+myAnnotation <- cpg.annotate(beta_noxy, datatype = "array", 
+                             analysis.type="differential", design=design, 
+                             what="Beta", arraytype = "450K", coef="CT - CC", contrasts=T, cont.matrix = contrast.matrix
+							 )
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+results.ranges <- extractRanges(DMRs, genome = "hg19")
+DMRlist <- (DMRs$results) # rank ordered result list
+
+
+## Dump file for web based epigenetic age prediction on 450k data
+## For EPIC, use agep function of wateRmelon on dasen normalized beta
+epi <- data.frame(row.names(rawbeta),rawbeta)
+epicols <- colnames(epi)
+epicols[1] <- "ProbeID"
+colnames(epi) <- epicols
+write.csv(epi, "foragecalc.csv", row.names=F) #use this for https://dnamage.genetics.ucla.edu
+ 
+
+
+##Perform GO and KEGG analysis using missMethyl package
+library(missMethyl)
+library(annotate)
+library(org.Hs.eg.db)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(clusterProfiler)
+library(KEGGREST)
+	
+
+#Perform gene ontology on 'sig' from limma with probesnames from DMPs used as a background
+gont <- gometh(sig.cpg=rownames(sig), all.cpg=rownames(DMPs), collection="GO", prior.prob=T, array.type="450K")
+gont <- (gont[order(gont$P.DE),])
+
+#Perform KEGG analysis by pulling down KEGG data and assessing with gsameth function (again with sig as test, DMPs variable as background list)
+hsa_kegg = download_KEGG('hsa')
+kegg <- hsa_kegg$KEGGPATHID2EXTID
+k <- dcast(kegg, kegg$to ~ kegg$from)
+k <- data.frame(k[2:ncol(k)])
+testpathway <- gsameth(sig.cpg=rownames(sig), all.cpg=rownames(DMPs), collection=k, prior.prob=T, plot.bias=T, array.type="450K")
+testpathway <- data.frame(testpathway)
+testpathway <- (testpathway[order(testpathway$P.DE),])
+
+#Look to annotate the KEGG pathways into something readable rather than simply a number
+desc <- ""
+for (i in 1:nrow(testpathway)) {
+rownames(testpathway)[i] -> ref
+xxx <- keggGet(ref)
+desc[i] <- xxx[[1]]$NAME
+}
+testpathway <- data.frame(desc, testpathway)
+
+
+write.csv(testpathway, "KEGG.csv")
+write.csv(gont, "GO.csv")
+
+
+##read in EPIC data to compare other datasets
+library(wateRmelon)
+setwd("/mnt/data1/DNMT3Aextra")
+path <- "/mnt/data1/DNMT3Aextra/idatsextend"
+annotEPIC <- read.csv("MethylationEPIC_v-1-0_B4.csv", header=T, stringsAsFactors=F, skip=7)
+m <- readEPIC(path, n=T, oob=T)
+
+#normalize
+meth.pf <- pfilter(m)
+meth.pf.dasen <- dasen(meth.pf)
+#meth.dasen <- dasen(m)
+betaEPIC <- betas(meth.pf.dasen)
+rawbetaEPIC <- betas(m)
+x <- agep(betaEPIC)
+
+phenoEPIC <- read.csv("SampleSheet2.csv")
+
+#add more friendly names to the columns
+x <- colnames(betaEPIC)
+x <- gsub("outlier/","",x) #added as outlier string added by watermelon in new version ?
+idatID <- paste(phenoEPIC$Sentrix_ID,"_",phenoEPIC$Sentrix_Position, sep="")
+y <- match(x,idatID)
+y <- phenoEPIC[y,1]  #substitue in real names
+colnames(betaEPIC) <- y
+
+
+
+#reshuffle the phenoEPIC file
+x <- colnames(betaEPIC)
+y <- match(x,phenoEPIC$Sample_ID)
+phenoEPIC <- phenoEPIC[y,]  #retrieve in correct order
+phenoEPIC$Group <- as.factor(phenoEPIC$Group)
+
+#remove cross hyb probes - files from supplementary data at https://doi.org/10.1186/s13059-016-1066-1 and https://dx.doi.org/10.1016%2Fj.gdata.2016.05.012
+crosshyb <- read.table("/mnt/data1/EPIC_reference/CrossHydridisingProbes_McCartney.txt", stringsAsFactors = F)
+crosshybS1 <- read.csv("/mnt/data1/EPIC_reference/Pidsley_SM1.csv", stringsAsFactors = F) #Pidlsey crosshyb probes
+SNPhybs <- read.table("/mnt/data1/EPIC_reference/SNPProbes_McCartney.txt", header=T, stringsAsFactors = F)
+SNPhybsS4 <- read.csv("/mnt/data1/EPIC_reference/Pidsley_SM4.csv", stringsAsFactors = F) #Pidsley SNPs
+SNPhybsS5 <- read.csv("/mnt/data1/EPIC_reference/Pidsley_SM5.csv", stringsAsFactors = F)
+SNPhybsS6 <- read.csv("/mnt/data1/EPIC_reference/Pidsley_SM6.csv", stringsAsFactors = F)
+
+#remove crosshyb probes from above datasets
+y <- rownames(betaEPIC)
+x <- y %in% crosshyb$V1
+betaEPIC <- betaEPIC[!x,]
+y <- rownames(betaEPIC)
+x <- y %in% crosshybS1$X
+betaEPIC <- betaEPIC[!x,]
+
+snpProbes<-SNPhybs[which(SNPhybs$EUR_AF >= 0.05 & SNPhybs$EUR_AF <= 0.95),]
+
+y <- rownames(betaEPIC)
+x <- y %in% snpProbes$IlmnID
+betaEPIC <- betaEPIC[!x,]
+
+y <- rownames(betaEPIC)
+x <- y %in% SNPhybsS4$PROBE
+betaEPIC <- betaEPIC[!x,]
+
+y <- rownames(betaEPIC)
+x <- y %in% SNPhybsS5$PROBE
+betaEPIC <- betaEPIC[!x,]
+
+y <- rownames(betaEPIC)
+x <- y %in% SNPhybsS6$PROBE
+betaEPIC <- betaEPIC[!x,]
+
+#remove rs SNPs
+betaEPIC <- betaEPIC[!grepl("rs", rownames(betaEPIC)),]
+
+#remove XY chromosomes
+betaEPIC_allchr <- betaEPIC
+xyprobes <- subset(annotEPIC, annotEPIC$CHR == "X" | annotEPIC$CHR == "Y" | annotEPIC$CHR =="XY")
+y <- rownames(betaEPIC)
+x <- y %in% xyprobes$IlmnID
+betaEPIC <- betaEPIC[!x,] 
+rm(xyprobes)
+
+
+#Comparison of R771 DMPs to EPIC data
+R771 <- sig
+R771beta <- beta
+R771betanoxy <- beta_noxy
+R771annot <- annot
+R771pheno <- pheno
+
+meanEPICControl <- apply(betaEPIC[,phenoEPIC$Group=="C"],1,mean)
+meanEPICMutant <- apply(betaEPIC[,phenoEPIC$Group=="D"],1,mean)
+mean450kControl <- apply(R771betanoxy[,R771pheno$Genotype=="CC"],1,mean)
+mean450kMutant <- apply(R771betanoxy[,R771pheno$Genotype=="CT"],1,mean)
+
+delta450k <- mean450kMutant-mean450kControl
+x <- match(rownames(R771), names(delta450k)) #subset to DMPs fround in R771 only
+deltaR771 <- delta450k[x]
+plot(hist(deltaR771[R771$adj.P.Val < 0.05],breaks=100)) #check all good
+
+deltaEPIC <- meanEPICMutant-meanEPICControl
+x <- match(rownames(R771), names(deltaEPIC))
+deltaEPICfromR771 <- deltaEPIC[x]
+plot(hist(deltaEPICfromR771,breaks=100)) #check all good
+
+#filter to only overlapping probes
+x <- match(names(deltaEPICfromR771), names(delta450k)) #subset to DMPs that are shared in EPIC
+deltaR771 <- delta450k[x]
+plot(hist(deltaR771[R771$adj.P.Val < 0.05],breaks=100)) #check all good
+
+#Plot effect size
+plot(deltaEPICfromR771, deltaR771, pch=16, cex=0.5, xlim=c(-0.6,+0.6), ylim=c(-0.6,0.6), ylab="DNMT3A p.(Arg771Gln)", xlab="Other TBRS DNMT3A mutations")
+abline(v=0, h=0, col="red")
+cor.test(deltaEPICfromR771, deltaR771)
+
+
+#draw boxplot showing effect size of E771 identified DMPs in other samples
+deltaEPIC <- betaEPIC-meanEPICControl
+deltaEPIC <- deltaEPIC[,phenoEPIC$Group=="D"]
+x <- match(names(deltaR771),rownames(deltaEPIC))
+sigprobesinEPIC <- deltaEPIC[x,]
+finaldeltavalues <- cbind(deltaR771, sigprobesinEPIC)
+finaldeltavalues <- cbind(deltaR771[deltaR771<0], sigprobesinEPIC)
+boxplot(sigprobesinEPIC[,4],sigprobesinEPIC[,13],sigprobesinEPIC[,9],sigprobesinEPIC[,3],sigprobesinEPIC[,6],sigprobesinEPIC[,5],sigprobesinEPIC[,11],sigprobesinEPIC[,12],sigprobesinEPIC[,1],sigprobesinEPIC[,8],sigprobesinEPIC[,7],finaldeltavalues[,1],sigprobesinEPIC[,14],sigprobesinEPIC[,15],sigprobesinEPIC[,2],sigprobesinEPIC[,10], outline=F, las=2, ylab=("change in methylation beta value"), col=c(6,7,5,7,7,7,7,7,7,6,5,3,7,7,7,7,7), cex.axis=1.5, cex.lab=1.5)
